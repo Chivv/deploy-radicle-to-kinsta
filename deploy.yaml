@@ -1,0 +1,121 @@
+name: Deploy Radicle to Kinsta
+
+on:
+  push:
+    branches:
+      - development
+      - master
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        environment: [development, production]
+        include:
+          - environment: development
+            branch: development
+            host: ${{ secrets.DEVELOPMENT_HOST }}
+            port: ${{ secrets.DEVELOPMENT_PORT }}
+            user: ${{ secrets.DEVELOPMENT_SSH_USERNAME }}
+            remote_dir: ${{ secrets.DEVELOPMENT_REMOTE_DIR }}
+            domain: ${{ secrets.DEVELOPMENT_DOMAIN }}
+          - environment: production
+            branch: master
+            host: ${{ secrets.PRODUCTION_HOST }}
+            port: ${{ secrets.PRODUCTION_PORT }}
+            user: ${{ secrets.PRODUCTION_SSH_USERNAME }}
+            remote_dir: ${{ secrets.PRODUCTION_REMOTE_DIR }}
+            domain: ${{ secrets.PRODUCTION_DOMAIN }}
+    # Add an "if" condition to only run for the matching branch
+    if: github.ref == 'refs/heads/' + matrix.branch
+
+    steps:
+      # Check out the repository code
+      - uses: actions/checkout@v2
+
+      # Setup Node.js for building JS assets
+      - uses: actions/setup-node@v2
+        with:
+          node-version: '22'
+
+      # Setup PHP version for Composer dependencies
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+
+      # Manually configure SSH (Development or Production)
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -p ${{ matrix.port }} -H ${{ matrix.host }} >> ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
+          eval $(ssh-agent -s)
+          ssh-add ~/.ssh/id_rsa
+
+      # Cache Composer packages
+      - name: Cache Composer packages
+        id: composer-cache
+        uses: actions/cache@v2
+        with:
+          path: vendor
+          key: ${{ runner.os }}-php-${{ hashFiles('**/composer.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-php-
+
+      # Install PHP dependencies
+      - name: Install Composer Bedrock
+        run: composer install --prefer-dist --no-progress
+
+      # Build JavaScript assets using NPM
+      - name: Install and build JS dependencies
+        run: npm install && npm run build
+
+      # Create Release Directory on the Remote Server
+      - name: Create Release Dir On Remote
+        run: ssh ${{ matrix.user }}@${{ matrix.host }} -p ${{ matrix.port }} 'mkdir -p ${{ matrix.remote_dir }}/public/deploy/${{ github.sha }}'
+
+      # Make symlink for .env
+      - name: Make symlink for .env
+        run: ssh ${{ matrix.user }}@${{ matrix.host }} -p ${{ matrix.port }} "ln -sfn ${{ matrix.remote_dir }}/public/shared/.env ${{ matrix.remote_dir }}/public/deploy/${{ github.sha }}/.env"
+
+      # Copy files to server
+      - name: rsync deployments
+        uses: burnett01/rsync-deployments@7.0.1
+        with:
+          switches: -avzr --delete --exclude=".env" --exclude=".git/" --exclude=".radicle-setup" --exclude=".husky" --exclude=".lando.yml" --exclude=".github/" --exclude=".gitignore"
+          path: /
+          remote_path: ${{ matrix.remote_dir }}/public/deploy/${{ github.sha }}
+          remote_host: ${{ matrix.host }}
+          remote_port: ${{ matrix.port }}
+          remote_user: ${{ matrix.user }}
+          remote_key: ${{ secrets.SSH_KEY }}
+
+      # Remove the existing 'public' directory or symlink if it exists
+      - name: Remove existing 'public' symlink or directory
+        run: ssh ${{ matrix.user }}@${{ matrix.host }} -p ${{ matrix.port }} "rm -rf ${{ matrix.remote_dir }}/public/deploy/${{ github.sha }}/public/content/uploads"
+
+      # Ensure Shared Symlinks (e.g., uploads directory)
+      - name: Ensure shared symlinks
+        run: |
+          ssh ${{ matrix.user }}@${{ matrix.host }} -p ${{ matrix.port }} 'mkdir -p ${{ matrix.remote_dir }}/public/shared/uploads && ln -sfn ${{ matrix.remote_dir }}/public/shared/uploads ${{ matrix.remote_dir }}/public/deploy/${{ github.sha }}/public/content/uploads'
+
+      # Remove the existing 'current' directory or symlink if it exists
+      - name: Remove existing 'current' symlink or directory
+        run: ssh ${{ matrix.user }}@${{ matrix.host }} -p ${{ matrix.port }} "rm -rf ${{ matrix.remote_dir }}/public/current"
+
+      # Promote the newly deployed release by symlinking to the current directory
+      - name: Promote symlink
+        run: ssh ${{ matrix.user }}@${{ matrix.host }} -p ${{ matrix.port }} "ln -sfn ${{ matrix.remote_dir }}/public/deploy/${{ github.sha }} ${{ matrix.remote_dir }}/public/current"
+
+      # Clear cache on Kinsta after the deployment
+      - name: Clear cache on Kinsta
+        run: ssh ${{ matrix.user }}@${{ matrix.host }} -p ${{ matrix.port }} 'curl https://${{ matrix.domain }}/kinsta-clear-cache-all'
+
+      # Cleanup older deployments (keep only the latest 3)
+      - name: Cleanup old deployments
+        run: ssh ${{ matrix.user }}@${{ matrix.host }} -p ${{ matrix.port }} "cd ${{ matrix.remote_dir }}/public/deploy && ls -t | tail -n +4 | xargs rm -rf"
